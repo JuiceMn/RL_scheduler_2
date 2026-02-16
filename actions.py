@@ -29,12 +29,13 @@ class ActionDecoder:
 
     # ---------- Encoding / Decoding ----------
 
-    def decode_assign(self, a: int) -> Action:
+    def decode_assign(self, a: int) :
         # print(f'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww{a}')
-        if not 0 <= a <= self.M * self.I:
-            raise ValueError(f"Assign‐action {a} out of range [0..{self.M*self.I}]")
+        # if not 0 <= a <= self.M * self.I:
+        #     raise ValueError(f"Assign‐action {a} out of range [0..{self.M*self.I}]")
         if a == self.M * self.I:
             return Action('hold', None, None)
+
         core = a // self.M
         slot = a % self.M
         return Action('assign', core, slot)
@@ -63,8 +64,10 @@ class ActionDecoder:
             #     print(f'slot is : {slot}, active : {len(scheduler.activeQueue)}')
             #     print("%%%%")
             # print(len(scheduler.activeQueue))
+            # print(slot, len(scheduler.activeQueue))
             if (slot < len(scheduler.activeQueue)) and scheduler.check_assign(core, slot) :
                 # print(slot, 'belong_to_valid_checker !')
+
                 # print(self.M, 'belong_to_valid_checker as M  !')
                 mask[a] = True
 
@@ -72,14 +75,18 @@ class ActionDecoder:
         mask[self.M * self.I] = True
         return  torch.tensor(mask, dtype=torch.bool)
 
-    def valid_delay_mask(self, scheduler: Scheduler) -> torch.Tensor:
+    def max_delay_bound(self, scheduler, assign: int) -> int:
         """
-        Returns a torch boolean mask of length D_max where mask[k] == True
-        iff delay = k+1  is <= scheduler.compute_max_idle().
+        assign: int in [0 .. Q*C] where Q*C is HOLD
+        returns: max_delay (>=0) as python int
         """
-        delta = scheduler.compute_max_idle()
-        # clamp into [0..D_max]
-        delta = max(0, min(delta, self.D_max))
-        # delays are 1..D_max; mask[i] corresponds to delay=(i+1)
-        mask = [(i+1) <= delta for i in range(self.D_max)]
-        return torch.tensor(mask, dtype=torch.bool)
+        # print(assign)
+        if assign != self.M * self.I:
+            core = assign // self.M
+            slot = assign % self.M
+        else :
+            return 0
+        md = int(scheduler.get_max_delay_time(core, slot))
+        return max(0, md)
+
+
