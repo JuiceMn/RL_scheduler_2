@@ -32,6 +32,7 @@ class Scheduler:
         # self.running_job = [None] * self.I
         # instead of a single slot per core, keep a queue
         self.pipeline: List[Deque[Task]]   = [deque() for _ in range(self.I)]
+        self.wait_pipeline: List[Deque[Task]]   = [deque() for _ in range(self.I)]
         self.finished_tasks: List[Task] = [] # finish tracking
         self.deadline_miss_in_active : List[Task] = []
         self.remainingTime:  List[int]      = [0]*self.I ## “How many ticks left until core i is free?” Starts at 0 (idle).
@@ -159,6 +160,7 @@ class Scheduler:
         self.active_queue_miss_counter = 0
         for i in range(self.I):
             self.pipeline[i].clear()
+            self.wait_pipeline[i].clear()
             self.remainingTime[i] = 0
             self.nextFreeTime[i]  = 0
             self.each_core_util[i] = 0
@@ -542,28 +544,18 @@ class Scheduler:
 
     ##################################################################################################################################################################################
 ##################################################################################################################################################################################
-    def assign(self, i: int, m: int) -> None:
-        # print('wow we are here ! ')
-        # print(m, i)
-        # print ('*' * 10 )
-        # print ((self.activeQueue[5]))
-        # print (len(self.activeQueue), len(self.backlog))
-        # print(m,'***', 'belong to before actual assign ')
-        # print(self.activeQueue)
+    def assign(self, i: int, m: int, delay: int) -> None:
+
+
         if self.activeQueue :
             job = self.activeQueue[m]
-        # if i+1 == 2 :
-        #     self.number_two_assign +=1
-        #     self.assign_to_2.append(job.task_name)
-        #     # print (f"suitable core  : {i+1} --- task name : {job.task_name}")
-        # if i + 1 == 6 :
-        #     self.assign_to_6.append(job.task_name)
-        #     self.number_6_assign += 1
+
         if job.rt_est[i] == 23686 or job.rt_est[i] == 530:
             # print(job.task_name, 'fff')
             i = 0
         # print(job.task_name, i + 1)
         if job.slack_time > 0 : # don't waste my time
+
             if self.pipeline[i] :
                 if job.deadline > self.pipeline[i][0][0].deadline :
                     # print(job.deadline, self.pipeline[i][0][0].deadline)
@@ -623,12 +615,15 @@ class Scheduler:
             # self.total_wipe+=1
             # del self.activeQueue[m]
         # print ("can we reach here?")
-        self._refill_queue()
+
+
+            self._refill_queue()
 
 
 ##################################################################################################################################################################################
 ##################################################################################################################################################################################
     def step(self, action1: Tuple[str, int, int], action2: int) :
+        # print(action1)
         cmd, i, m = action1
         self.ccmd = cmd
         delay = action2
@@ -639,13 +634,13 @@ class Scheduler:
 
 
         if cmd == 'hold':
-            # print(cmd, delay)
-            # mark that we held this timestep
-            self.hold = 1 if self.compute_max_idle() != 0 else 0 #  now we are good ! =>stuck at zero (gnd)
-            # advance time once
-            if self.compute_max_idle() != 0 :
-                self.total_delay_slack += self.compute_max_idle()
-            self.hold_time = self.compute_max_idle()
+            # # print(cmd, delay)
+            # # mark that we held this timestep
+            # self.hold = 1 if self.compute_max_idle() != 0 else 0 #  now we are good ! =>stuck at zero (gnd)
+            # # advance time once
+            # if self.compute_max_idle() != 0 :
+            #     self.total_delay_slack += self.compute_max_idle()
+            # self.hold_time = self.compute_max_idle()
             self._advance_time()
             # use your hold reward
             # reward = self.hold_reward
@@ -653,7 +648,11 @@ class Scheduler:
         elif cmd == 'assign' and self.check_assign(i, m) :
             # perform assignment exactly as before
             # print(m,i, len(self.activeQueue), len(self.backlog), cmd, self.t)
-            self.assign(i, m)
+            if delay != 0 :
+                job_delay = self.activeQueue[m]
+                job_delay.task_delay = delay
+                job_delay.rt_est[i]+= delay
+            self.assign(i, m, delay)
             # self._advance_time() tested
             # base_reward = self._compute_reward()
             # penalty = self.charge_penalty if self.charging_flag else 0.0
@@ -727,6 +726,8 @@ class Scheduler:
         """
         remain = []  # List to store the remaining time for tasks in all cores
 
+        remain_delay_last = []
+
         for i in range(self.I):
             if self.pipeline[i]:
                 # Get the finish time of the first task in the pipeline
@@ -734,11 +735,14 @@ class Scheduler:
                 remaining_time = finish_t - self.t
                 # Add the remaining time to the remain list
                 remain.append(remaining_time)
+            remain_delay = []
+
 
         return remain
 
     ##################################################################################################################################################################################
     def _advance_time(self):
+        # print(self.t)
         """
         Advance time either by a hold interval (if self.hold == 1) or by the next
         task‐completion interval.  In both cases, pop finished jobs, charge the battery,
@@ -793,16 +797,15 @@ class Scheduler:
                 job, exec_t, finish_t, energy_consumption = self.pipeline[i][0] # energy_consumption was granted as well
                 remaining = finish_t - self.t
                 if remaining <= 0:
-                    # if i + 1 == 2 :
-                    #     self.number_two_eject += 1
-                    # if i + 1 == 6 :
-                    #     self.number_6_eject+=1
-
                     self.each_core_util[i] += exec_t
                     self.battery.current = max(0.0, self.battery.current - energy_consumption)
                     # print (self.battery.current,'xx', energy_consumption,'xx',job.task_name, i )
                     self.pipeline[i].popleft()
                     self._finish_core(job, energy_consumption, exec_t)
+            # if self.wait_pipeline[i] :
+            #     for task in self.wait_pipeline[i]:
+            #         if task.task_delay > 0:
+            #             task.task_delay = max(0, task.task_delay - dt)
 
 
         # print(self.remainingTime)
@@ -859,6 +862,8 @@ class Scheduler:
             job = self.backlog.popleft()
             # print(self.t - job.arrival_time)
             self.activeQueue.append(job)
+            # print ("len is : ")
+            # print(len(self.activeQueue))
             # self.nowcounter += 1
             # print(self.nowcounter, self.t, job.task_name)
 ##################################################################################################################################################################################
@@ -1128,3 +1133,16 @@ class Scheduler:
 
     def get_time(self) -> int:
         return int(self.t)
+
+    def get_max_delay_time(self, i, m) -> int:
+        # print (m, len(self.activeQueue))
+        # print(self.activeQueue)
+        if self.activeQueue and self.check_assign(i, m) :
+            job = self.activeQueue[int(m)]
+            # print(f'before fucked : {job.deadline}, {job.rt_est[int(i)]},{job.task_name}, {job.task_delay} and its damn chosen core ! : {i+1}')
+            max_delay = job.deadline - job.rt_est[int(i)]
+            if job.rt_est[int(i)] > 100000000000000000 :
+                return  0
+            return max_delay
+        else :
+            return  0
