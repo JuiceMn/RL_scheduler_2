@@ -537,6 +537,7 @@ class Scheduler:
             self.total_wipe+=1
             del self.activeQueue[m]
             self._refill_queue()
+            return False
 
 
         return True  # all good
