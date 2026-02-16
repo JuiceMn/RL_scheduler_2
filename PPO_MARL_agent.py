@@ -850,15 +850,12 @@ class PPO():
             mask1 = torch.as_tensor(mask1, dtype=torch.bool, device=state.device)
         self.masks1.append(mask1.detach().to("cpu"))
 
-        # mask2 is actually max_delay now; make it a Long tensor
         if torch.is_tensor(mask2):
-            md = mask2.detach()
+            md = mask2.detach().to("cpu").long()
         else:
-            # numpy scalar/array or python int -> tensor
-            md = torch.as_tensor(mask2, dtype=torch.long, device=state.device)
-
-        # ensure it's at least 1D or scalar is fine; just store on cpu
-        self.masks2.append(md.to("cpu"))
+            md = torch.as_tensor(mask2, dtype=torch.long).to("cpu")
+        md = md.view(1)
+        self.masks2.append(md)
 
     def clear_memory(self):
         self.rewards_seq = []
@@ -909,9 +906,9 @@ class PPO():
             self,
             states,
             pair_mask,
+            max_delay,
             pair_actions,
             delay_actions,
-            max_delay,  # NEW: needed for delay logprob reconstruction
             advantages,
             old_log_probs1,
             old_log_probs2
@@ -1083,6 +1080,7 @@ def train(env):
                 o = o.reshape(1, 9 + 9 + 1 + 9, 24)
                 state = torch.FloatTensor(o).to(device)
                 mask1 = env.get_valid_assign_mask() ## for now just assign_task ! next we need delay as well !
+
                 mask1 = torch.tensor(np.stack(mask1), dtype=torch.bool, device=device)
                 # print(mask1)
                 # mask2 = torch.tensor(np.stack(mask2), dtype=torch.bool, device=device)
@@ -1104,7 +1102,7 @@ def train(env):
 
             # print(print(f'agent : {pair_action.item()}'))
             # if pair_action != 180 :
-            delay_action = int(delay_action)
+            # delay_action = int(delay_action)
             # if delay_action != 0:
             #     print(delay_action)
             o, r, d, truncated, infos = env.step((pair_action.item(),100))
@@ -1129,6 +1127,8 @@ def train(env):
                 o, _ = env.reset()
                 r = 0
                 d = False
+                ep_len_int = ep_len
+                ppo.batch_size = ep_len_int
                 ep_ret = 0
                 ep_len = 0
                 print(f'{t} : traj_num')
