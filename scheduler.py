@@ -5,6 +5,7 @@ from collections import deque
 import math
 import itertools
 
+from sympy import false
 from torch.distributed.pipelining import pipeline
 
 from cores_and_tasks_batt import Core, Task, Battery
@@ -556,7 +557,6 @@ class Scheduler:
             i = 0
         # print(job.task_name, i + 1)
         if job.slack_time > 0 : # don't waste my time
-
             if self.pipeline[i] :
                 if job.deadline > self.pipeline[i][0][0].deadline :
                     # print(job.deadline, self.pipeline[i][0][0].deadline)
@@ -576,6 +576,8 @@ class Scheduler:
                         ####################################
                         # self.battery.current = max(0.0, self.battery.current - job.WCEC[i])
                         del self.activeQueue[m]
+                    else :
+                        self._advance_time()
                 else :
                     finish_time = self.t + job.rt_est[i]
                     if job.deadline >= finish_time :
@@ -594,6 +596,8 @@ class Scheduler:
                     #####################################
                     # job.start_time = start_time
                         job.finish_time = end_time
+                    else :
+                        self._advance_time()
             else :
                 energy_consumption = job.WCEC[i]
                 execution_time = job.rt_est[i]  # execution time on core i
@@ -611,8 +615,10 @@ class Scheduler:
                     ####################################
                     # self.battery.current = max(0.0, self.battery.current - job.WCEC[i])
                     del self.activeQueue[m]
+                else :
+                    self._advance_time()
         else :
-            pass
+            self._advance_time()
             # self.total_wipe+=1
             # del self.activeQueue[m]
         # print ("can we reach here?")
@@ -649,8 +655,14 @@ class Scheduler:
         elif cmd == 'assign' and self.check_assign(i, m) :
             # perform assignment exactly as before
             # print(m,i, len(self.activeQueue), len(self.backlog), cmd, self.t)
+            job_delay = self.activeQueue[m]
+            if job_delay.naughty_task :
+                job_delay.naughty_task = False
+                job_delay.rt_est[i] -= job_delay.task_delay
+                job_delay.task_delay = 0
+
             if delay != 0 :
-                job_delay = self.activeQueue[m]
+                job_delay.naughty_task = True
                 job_delay.task_delay = delay
                 job_delay.rt_est[i]+= delay
             self.assign(i, m, delay)
