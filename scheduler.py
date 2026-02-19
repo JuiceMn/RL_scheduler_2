@@ -78,6 +78,7 @@ class Scheduler:
         self.max_deadline = 0
         self.ccmd = ''
         self.valid_vector = [None] * 6
+        self.fail_assign = 0
 
 ##################################################################################################################################################################################
 ##################################################################################################################################################################################
@@ -183,6 +184,7 @@ class Scheduler:
         self.number_two_eject = 0
         self.number_6_assign = 0
         self.number_6_eject = 0
+        self.fail_assign = 0
         self.assign_to_2 = []
         self.assign_to_6 = []
         # pre‐fill arrivals at t=0
@@ -451,12 +453,12 @@ class Scheduler:
          - 'energy'          instant battery
          - 'budget'          SSE/future-budget
         """
+
         if m >= len(self.activeQueue):
             # print('out of range !')
             # self.valid_vector[0] = 1
             # print('m >= len(self.activeQueue)')
             return False
-
         job  = self.activeQueue[m]
         core = self.cores[i]
 
@@ -500,6 +502,7 @@ class Scheduler:
             # print ('damn charge')
             # self.valid_vector[4] = 1
             # print('self.battery.current < job.WCEC[i]')
+                # print ("naughty reach here ! ")
             return False
 
 
@@ -513,7 +516,7 @@ class Scheduler:
         # print(m, 'belong to before valid assign ')
         #######################################################################################
         #######################################################################################
-        if job.slack_time > 0 : # don't waste my time
+        if job.slack_time - job.rt_est[i] > 0 : # don't waste my time
             if self.pipeline[i] :
                 if job.deadline > self.pipeline[i][0][0].deadline :
                     # print(job.deadline, self.pipeline[i][0][0].deadline)
@@ -525,14 +528,14 @@ class Scheduler:
                 else :
                     finish_time = self.t + job.rt_est[i]
                     if job.deadline < finish_time :
-                        # print('cant run')
+                        # print('cant run_1')
                         return False
                     #####################################
             else :
                 execution_time = job.rt_est[i]  # execution time on core i
                 finish_time = max(self.t, self.nextFreeTime[i]) + execution_time  # actual finish time
                 if job.deadline < finish_time :
-                    # print('cant run')
+                    # print('cant run_2')
                     return False
         else :
             self.total_wipe+=1
@@ -546,22 +549,22 @@ class Scheduler:
 
     ##################################################################################################################################################################################
 ##################################################################################################################################################################################
-    def assign(self, i: int, m: int, delay: int) -> None:
+    def assign(self, i: int, m: int, delay: int) -> bool:
 
 
         if self.activeQueue :
             job = self.activeQueue[m]
-
-        if job.rt_est[i] == 23686 or job.rt_est[i] == 530:
-            # print(job.task_name, 'fff')
-            i = 0
+        #
+        # if job.rt_est[i] == 23686 or job.rt_est[i] == 530:
+        #     # print(job.task_name, 'fff')
+        #     i = 0
         # print(job.task_name, i + 1)
-        if job.slack_time > 0 : # don't waste my time
+        if job.slack_time - job.rt_est[i]> 0 : # don't waste my time
             if self.pipeline[i] :
                 if job.deadline > self.pipeline[i][0][0].deadline :
                     # print(job.deadline, self.pipeline[i][0][0].deadline)
                     energy_consumption = job.WCEC[i]
-                    execution_time = job.rt_est[i]  # execution time on core i
+                    execution_time = job.rt_est[i] + delay  # execution time on core i
                     finish_time = max(self.t, self.nextFreeTime[i]) + execution_time  # actual finish time
                     if job.deadline >= finish_time : # maybe there is a better core to run !
                         self.pipeline[i].append([job, execution_time, finish_time, energy_consumption])  # Appending the tuple
@@ -576,8 +579,13 @@ class Scheduler:
                         ####################################
                         # self.battery.current = max(0.0, self.battery.current - job.WCEC[i])
                         del self.activeQueue[m]
+                        self._refill_queue()
+                        return True
                     else :
+                        self.fail_assign += 1
+                        # print("we reach this shit whole_1")
                         self._advance_time()
+
                 else :
                     finish_time = self.t + job.rt_est[i]
                     if job.deadline >= finish_time :
@@ -585,22 +593,27 @@ class Scheduler:
                             item[0].finish_time += job.rt_est[i]
                             item[2] += job.rt_est[i]
                         energy_consumption = job.WCEC[i]
-                        execution_time = job.rt_est[i]  # execution time on core i
+                        execution_time = job.rt_est[i] + delay # execution time on core i
                         self.pipeline[i].appendleft([job, execution_time, finish_time, energy_consumption])
                         start_time = self.t
                         end_time = start_time + job.rt_est[i]
                         # this 2 need to check
                         self.nextFreeTime[i] += job.rt_est[i]
                         self.remainingTime[i] += job.rt_est[i]
+                        job.finish_time = end_time
                         del self.activeQueue[m]
+                        self._refill_queue()
+                        return True
                     #####################################
                     # job.start_time = start_time
-                        job.finish_time = end_time
+
                     else :
+                        self.fail_assign += 1
+                        # print("we reach this shit whole_2")
                         self._advance_time()
             else :
                 energy_consumption = job.WCEC[i]
-                execution_time = job.rt_est[i]  # execution time on core i
+                execution_time = job.rt_est[i] + delay # execution time on core i
                 finish_time = max(self.t, self.nextFreeTime[i]) + execution_time  # actual finish time
                 if job.deadline >= finish_time :
                     self.pipeline[i].append([job, execution_time, finish_time, energy_consumption])  # Appending the tuple
@@ -615,16 +628,22 @@ class Scheduler:
                     ####################################
                     # self.battery.current = max(0.0, self.battery.current - job.WCEC[i])
                     del self.activeQueue[m]
+
+                    return True
                 else :
+                    self.fail_assign += 1
+                    # print("we reach this shit whole_3")
                     self._advance_time()
         else :
+            # print("we reach this shit whole_4")
+            self.fail_assign += 1
             self._advance_time()
             # self.total_wipe+=1
             # del self.activeQueue[m]
         # print ("can we reach here?")
 
+            return False
 
-            self._refill_queue()
 
 
 ##################################################################################################################################################################################
@@ -655,17 +674,20 @@ class Scheduler:
         elif cmd == 'assign' and self.check_assign(i, m) :
             # perform assignment exactly as before
             # print(m,i, len(self.activeQueue), len(self.backlog), cmd, self.t)
+            check_fail_assign = False
             job_delay = self.activeQueue[m]
-            if job_delay.naughty_task :
-                job_delay.naughty_task = False
-                job_delay.rt_est[i] -= job_delay.task_delay
-                job_delay.task_delay = 0
+            # if job_delay.naughty_task :
+            #     job_delay.naughty_task = False
+            #     job_delay.rt_est[i] -= job_delay.task_delay
+            #     job_delay.task_delay = 0
 
             if delay != 0 :
-                job_delay.naughty_task = True
+                # job_delay.naughty_task = True
                 job_delay.task_delay = delay
-                job_delay.rt_est[i]+= delay
-            self.assign(i, m, delay)
+                # job_delay.rt_est[i]+= delay
+            check_fail_assign = self.assign(i, m, delay)
+            if check_fail_assign :
+                self.fail_assign = 0
             # self._advance_time() tested
             # base_reward = self._compute_reward()
             # penalty = self.charge_penalty if self.charging_flag else 0.0
@@ -680,7 +702,7 @@ class Scheduler:
 
         state  = self.build_state()
         done   = self._is_done()
-        reward, *_ = self._compute_reward()
+        reward, _, _, _ = self._compute_reward()
         info = {
             'episode': {
                 'r': reward,
@@ -916,7 +938,7 @@ class Scheduler:
         self.waiting_reward = sum(self.waiting_reward_vector)/len(self.waiting_reward_vector)
         self.runtime_reward=sum(self.runtime_reward_vector)/len(self.runtime_reward_vector)
         self.energy_reward=sum(self.energy_reward_vector)/len(self.energy_reward_vector)
-        self.met_deadline_reward = sum(self.met_deadline_reward_vector)/len(self.met_deadline_reward_vector)
+        self.met_deadline_reward = sum(self.met_deadline_reward_vector)#/len(self.met_deadline_reward_vector)
         # print (f'total shit here : {self.waiting_reward + self.energy_reward + self.runtime_reward}')
         # Energy Instead of time
         # self.runtime_reward = self.avg_runtime + max(10, Energy)   # threshold for reward
@@ -940,13 +962,13 @@ class Scheduler:
     def _compute_reward(self) -> [float, float, float, float]:
         # blending weights
         alpha, beta, gamma = 0.4, 0.3, 0.3
-        gg = 100
+        gg = 1000
         c         = float(self.met_deadline_reward)
         # print(c)
         runtime_t = float(self.runtime_reward)
         waiting_t = float(self.waiting_reward)
         energy_t   = float(self.energy_reward)
-        total = c - (alpha*runtime_t + gamma*waiting_t + beta*energy_t)/ gg
+        total = c #- (alpha*runtime_t + gamma*waiting_t + beta*energy_t)/ gg
 
         return  total, runtime_t, waiting_t, energy_t
 #################slack_per_job#############################################################################################################
@@ -1034,7 +1056,9 @@ class Scheduler:
          #default was 3600000
         # return  len(self.activeQueue)==0  and len(self.backlog)==0 and self.t>= 4000000
         # print (self.total_index , self.total_wipe, self.num_assigned)
-        return  self.num_assigned >= self.total_index - self.total_wipe
+        if self.fail_assign >= 10000 :
+            return True
+        return  self.num_assigned >= self.total_index - self.total_wipe # default
     def check_capability (self, job, core)-> Optional[bool]:
         # build boolean arrays of length 4
         req = np.array([
@@ -1152,6 +1176,11 @@ class Scheduler:
         # print(self.activeQueue)
         if self.activeQueue and self.check_assign(i, m) :
             job = self.activeQueue[int(m)]
+            # if job.naughty_task :
+            #     # print ("naughty reach here ! ")
+            #     job.naughty_task = False
+            #     job.rt_est[int(i)] -= job.task_delay
+            #     job.task_delay = 0
             # print(f'before fucked : {job.deadline}, {job.rt_est[int(i)]},{job.task_name}, {job.task_delay} and its damn chosen core ! : {i+1}')
             max_delay = job.deadline - job.rt_est[int(i)]
             if job.rt_est[int(i)] > 100000000000000000 :
