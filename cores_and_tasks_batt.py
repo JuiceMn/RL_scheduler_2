@@ -83,6 +83,8 @@ class Task:
         self.waiting_time = 0.0  
         self.slack_time   = 0.0
         self.back_log_score = max (self.rt_est) * max (self.WCEC)
+        self.task_delay = 0
+        self.naughty_task = False
 
     def feature_vector(self, current_time: int) -> List[float]:
         """
