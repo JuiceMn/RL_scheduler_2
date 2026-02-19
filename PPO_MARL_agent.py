@@ -1103,13 +1103,17 @@ def train(env):
             # print(print(f'agent : {pair_action.item()}'))
             # if pair_action != 180 :
             # delay_action = int(delay_action)
-            # if delay_action != 0:
-            #     print(delay_action)
-            o, r, d, truncated, infos = env.step((pair_action.item(),100))
+
+            # print(delay_action)
+            o, r, d, truncated, infos = env.step((pair_action.item(),int(delay_action)))
             ep_ret += r
             ep_len += 1
             if ep_ret != 0 :
-                print(ep_ret, ep_len, 'time:',env.scheduler.t, "nice_task:",env.scheduler.finish_on_time)
+                print('reward is :', ep_ret, ep_len, 'time:',env.scheduler.t, "nice_task:",env.scheduler.finish_on_time,
+                        "all execution : ", sum(env.scheduler.runtime_reward_vector), "all energy", sum(env.scheduler.energy_reward_vector),
+                      "total wipe:", env.scheduler.total_wipe,
+                      "total miss :", env.scheduler.active_queue_miss_counter,
+                      "all task :",   env.scheduler.task_name_finished  )
             # show_ret += r2
             # sjf += sjf_t
             # f1 += f1_t
@@ -1119,7 +1123,15 @@ def train(env):
             waiting                   += wt
             slack                    += st
             epoch_reward             += total_r
-
+            ppo.remember(state, value,
+                         pair_logprob,
+                         delay_logprob,
+                         pair_action,
+                         delay_action,
+                         epoch_reward,
+                         mask1,
+                         mask_delay,
+                         device)
             if d:
                 t += 1
                 ppo.storeIntoBuffter(r)
