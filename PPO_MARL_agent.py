@@ -12,7 +12,8 @@ import torch
 import gymnasium as gym
 import math
 from torch.distributions import Beta
-
+import torch.nn.functional as F
+from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 # import time
 # import matplotlib.pyplot as plt
 deque = __import__('collections').deque
@@ -135,12 +136,12 @@ class Buffer():
     def __init__(self):
         self.buffer_num = 0
         self.states = []
-        self.actions1 = []
-        self.actions2 = []
-        self.masks1 = []
-        self.masks2 = []
-        self.log_probs1 = []
-        self.log_probs2 = []
+        self.actions1 = []        # pair_action (int)
+        self.actions2 = []        # u (float in (0,1))  <-- Fix A
+        self.masks1 = []          # pair_mask
+        self.masks2 = []          # max_delay (long)
+        self.log_probs1 = []      # log pi(pair_action)
+        self.log_probs2 = []      # log pi(u)
         self.Returns = []
         self.advantages = []
 
@@ -156,18 +157,34 @@ class Buffer():
         self.Returns = []
         self.advantages = []
 
-    def store_buffer(self, state, mask1, mask2, action1, action2, log_prob1, log_prob2, Return, advantage,nums):
-        self.buffer_num = self.buffer_num + nums
+    def store_buffer(self,
+                     state,
+                     mask1,
+                     max_delay,
+                     action1,
+                     u,                 # <-- Fix A: store u instead of delay_int
+                     log_prob1,
+                     log_prob2,
+                     Return,
+                     advantage,
+                     nums):
+        """
+        Fix A buffer:
+          - action1: pair_action
+          - action2: u (Beta sample)
+          - masks2: max_delay (still stored)
+        """
+        self.buffer_num += nums
+
         self.states.extend(state)
         self.masks1.extend(mask1)
-        self.masks2.extend(mask2)
+        self.masks2.extend(max_delay)
         self.actions1.extend(action1)
-        self.actions2.extend(action2)
+        self.actions2.extend(u)            # <-- Fix A
         self.log_probs1.extend(log_prob1)
         self.log_probs2.extend(log_prob2)
         self.Returns.extend(Return)
         self.advantages.extend(advantage)
-
 
 class CategoricalMasked(Categorical):
     def __init__(self, probs=None, logits=None, validate_args=None, masks=None, device=None):
@@ -305,9 +322,27 @@ class ActorNet(nn.Module):
 
         # Delay head outputs 2 params (alpha_raw, beta_raw) -> alpha,beta via softplus
         self.DelayHead = nn.Sequential(
-            nn.Linear(4 * d_model, 256), nn.ReLU(),
+            nn.Linear(4 * d_model + 1, 256), nn.ReLU(),
             nn.Linear(256, 2)
         )
+
+        # ---- put this at the end of ActorNet.__init__, right after self.DelayHead is created ----
+        def softplus_inv(y: torch.Tensor) -> torch.Tensor:
+            # inverse of softplus for y>0
+            return torch.log(torch.expm1(torch.clamp(y, min=1e-8)))
+
+        u0 = 0.000001  # initial mean of u (small delay fraction)
+        kappa = 60.0  # concentration (bigger => less random)
+
+        alpha0 = torch.tensor(u0 * kappa)
+        beta0 = torch.tensor((1.0 - u0) * kappa)
+
+        last = self.DelayHead[-1]  # the final nn.Linear(256 -> 2)
+
+        # set bias so softplus(bias) ~= (alpha0, beta0)
+        with torch.no_grad():
+            b = torch.stack([softplus_inv(alpha0), softplus_inv(beta0)]).to(last.bias.device)
+            last.bias.copy_(b)
 
     # ----------------------------
     # Robust conversion helpers
@@ -430,14 +465,33 @@ class ActorNet(nn.Module):
         return torch.cat([pair_logits, hold_logit], dim=-1)
 
     # ---------- delay head (continuous fraction) ----------
-    def delay_params_with_action(self, x, pair_action, attn_mask=None, eps=1e-4):
+    def delay_params_with_action(self, x, pair_action, max_delay=None, attn_mask=None, eps=1e-4):
         """
         Returns (alpha, beta, is_hold).
         alpha,beta: (B,) positive
         """
+
         J, _, _, Cw, _, H, tokens = self._encode_rows(x)
         B = tokens.size(0)
         device = tokens.device
+        if max_delay is None:
+            md = torch.zeros(B, dtype=torch.long, device=device)
+        else:
+            if torch.is_tensor(max_delay):
+                md = max_delay.to(device).long().view(-1)
+            else:
+                md = torch.as_tensor(max_delay, device=device).long().view(-1)
+
+            if md.numel() == 1 and B > 1:
+                md = md.expand(B)
+            elif md.numel() != B:
+                raise ValueError(f"max_delay shape {md.shape} but expected 1 or {B}")
+
+        md = md.clamp(min=0)
+        md_norm = torch.log1p(md.float()).unsqueeze(-1)  # (B,1)
+        # md_norm = md_norm / 10.0
+        no_delay = (md == 0)
+        md_norm = torch.where(no_delay.unsqueeze(-1), torch.zeros_like(md_norm), md_norm)
 
         # FIX: pair_action may be numpy => convert to torch.LongTensor
         pair_action = self._ensure_pair_action(pair_action, B, device)
@@ -456,6 +510,10 @@ class ActorNet(nn.Module):
         pair_h   = H[batch_idx, i, j]
         pair_ctx_d = self.PairCtxToD(pair_h)
 
+
+        md_norm = torch.where(is_hold.unsqueeze(-1), torch.zeros_like(md_norm), md_norm)
+
+
         is_hold_f = is_hold.unsqueeze(-1)
         job_tok    = torch.where(is_hold_f, self.HoldJobEmb.expand_as(job_tok), job_tok)
         core_tok   = torch.where(is_hold_f, self.HoldCoreEmb.expand_as(core_tok), core_tok)
@@ -463,15 +521,15 @@ class ActorNet(nn.Module):
 
         state_ctx = self._attn_pool(tokens, attn_mask)
 
-        delay_in = torch.cat([state_ctx, job_tok, core_tok, pair_ctx_d], dim=-1)  # (B,4d)
-        ab_raw = self.DelayHead(delay_in)  # (B,2)
+        delay_in = torch.cat([state_ctx, job_tok, core_tok, pair_ctx_d, md_norm], dim=-1)  # (B,4d+1)
+        ab_raw = self.DelayHead(delay_in)
 
         alpha = F.softplus(ab_raw[:, 0]) + eps
         beta  = F.softplus(ab_raw[:, 1]) + eps
         return alpha, beta, is_hold
 
     def delay_dist_with_action(self, x, pair_action, attn_mask=None):
-        alpha, beta, is_hold = self.delay_params_with_action(x, pair_action, attn_mask)
+        alpha, beta, is_hold = self.delay_params_with_action(x, pair_action, max_delay=None, attn_mask=attn_mask)
         dist = torch.distributions.Beta(alpha, beta)
         return dist, is_hold
 
@@ -509,7 +567,7 @@ class ActorNet(nn.Module):
         pair_logits = self.forward(x)
         delay_params = None
         if pair_action is not None:
-            alpha, beta, is_hold = self.delay_params_with_action(x, pair_action, attn_mask)
+            alpha, beta, is_hold = self.delay_params_with_action(x, pair_action, max_delay=None, attn_mask=attn_mask)
             delay_params = (alpha, beta, is_hold)
         return pair_logits, delay_params
 
@@ -610,14 +668,6 @@ class PPO():
         self.featureNum3 = featureNum_size[2]
         self.featureNum4 = featureNum_size[3]
         self.delay_bins = delay_bins
-
-        self.device = device
-        self.actor_net = ActorNet(
-            self.num_inputs1, self.num_inputs2, self.num_inputs3, self.num_inputs4, self.featureNum1,
-            self.featureNum2, self.featureNum3, self.featureNum4).to(self.device)
-        self.critic_net = CriticNet(
-            self.num_inputs1, self.featureNum1, self.num_inputs2, self.featureNum2, self.num_inputs3,
-            self.featureNum3, self.featureNum4, self.num_inputs4).to(self.device)
         self.batch_size = batch_size
         self.gamma = 1
         self.lam = 0.97
@@ -634,16 +684,161 @@ class PPO():
         self.job_inputs = []
         self.buffer = Buffer()
 
-        self.ppo_update_time = 8
+        self.ppo_update_time = 5
         self.clip_param = 0.2
         self.max_grad_norm = 0.5
 
-        self.entropy_coefficient = 0
+        # entropy weights (separate!)
+        self.ent_coef_pair = 1e-3  # categorical entropy (pair head)
+        self.lr_shared = 3e-5  # shared trunk (encoders + shared projections)
+        self.lr_pair = 1e-4  # pair head (categorical)
+        self.lr_delay = 1e-5  # delay head (Beta) usually smaller
+        self.ent_coef_delay = 1e-4  # beta entropy (delay head) usually much smaller
 
+        self.lr_shared0 = self.lr_shared
+        self.lr_pair0 = self.lr_pair
+        self.lr_delay0 = self.lr_delay
+        self.target_kl = 0.02  # common: 0.01 to 0.05
+        # (optional) anneal critic too
+        self.lr_critic0 = 5e-4  # whatever you use
+
+        self.device = device
+        self.actor_net = ActorNet(
+            self.num_inputs1, self.num_inputs2, self.num_inputs3, self.num_inputs4, self.featureNum1,
+            self.featureNum2, self.featureNum3, self.featureNum4).to(self.device)
+        # -----------------------------
+        # Actor optimizer with param groups (different LRs)
+        # -----------------------------
+
+        # 1) pair-head-only params (categorical logits for (task,core) + HOLD)
+        pair_only = (
+                list(self.actor_net.PairScore.parameters()) +
+                list(self.actor_net.HoldHead.parameters())
+        )
+
+        # 2) delay-head-only params (Beta(alpha,beta) head + its pooling machinery)
+        delay_only = (
+                list(self.actor_net.DelayHead.parameters()) +
+                list(self.actor_net.TypeEmb.parameters()) +
+                list(self.actor_net.AttnWk.parameters()) +
+                list(self.actor_net.PairCtxToD.parameters()) +
+                [
+                    self.actor_net.attn_q,
+                    self.actor_net.HoldJobEmb,
+                    self.actor_net.HoldCoreEmb,
+                    self.actor_net.HoldPairCtx,
+                ]
+        )
+
+        # 3) shared trunk params = everything else (encoders + shared projections/fusion)
+        pair_ids = {id(p) for p in pair_only}
+        delay_ids = {id(p) for p in delay_only}
+
+        shared = [p for p in self.actor_net.parameters()
+                  if id(p) not in pair_ids and id(p) not in delay_ids]
+
+        # Optional sanity checks (run once)
+        assert pair_ids.isdisjoint(delay_ids), "pair_only and delay_only overlap!"
+        assert all(id(p) not in pair_ids and id(p) not in delay_ids for p in shared), "shared overlaps!"
+
+        # Create ONE optimizer with 3 param groups (different LR per group)
         self.actor_optimizer = optim.Adam(
-            self.actor_net.parameters(), lr=0.0001,eps=1e-6)
+            [
+                {"params": shared, "lr": self.lr_shared},
+                {"params": pair_only, "lr": self.lr_pair},
+                {"params": delay_only, "lr": self.lr_delay},
+            ],
+            eps=1e-6
+        )
+        self.critic_net = CriticNet(
+            self.num_inputs1, self.featureNum1, self.num_inputs2, self.featureNum2, self.num_inputs3,
+            self.featureNum3, self.featureNum4, self.num_inputs4).to(self.device)
+
+
+        # self.actor_optimizer = optim.Adam(
+        #     self.actor_net.parameters(), lr=0.0001,eps=1e-6)
+        # print("shared:", sum(p.numel() for p in shared))
+        # print("pair_only:", sum(p.numel() for p in pair_only))
+        # print("delay_only:", sum(p.numel() for p in delay_only))
         self.critic_net_optimizer = optim.Adam(
             self.critic_net.parameters(), lr=0.0005,eps=1e-6)
+
+    def set_lrs(self, progress_remaining: float):
+        """
+        progress_remaining: 1.0 at start -> 0.0 at end
+        """
+        pr = float(np.clip(progress_remaining, 0.0, 1.0))
+
+        # actor optimizer param_groups: [shared, pair_only, delay_only]
+        self.actor_optimizer.param_groups[0]["lr"] = self.lr_shared0 * pr
+        self.actor_optimizer.param_groups[1]["lr"] = self.lr_pair0 * pr
+        self.actor_optimizer.param_groups[2]["lr"] = self.lr_delay0 * pr
+
+        # (optional) critic LR anneal
+        for g in self.critic_net_optimizer.param_groups:
+            g["lr"] = self.lr_critic0 * pr
+
+    # def beta_round_delay_logprob(self, dist, delay_int, max_delay, eps=1e-12):
+    #     """
+    #     Log prob of executed integer delay when integer is produced by rounding:
+    #         delay_int = round(u * max_delay),   u ~ Beta(alpha,beta)
+    #
+    #     Uses interval mass via Beta CDF:
+    #       P(k) = F(upper_k) - F(lower_k)
+    #
+    #     NOTE: torch.distributions.Beta has no .cdf() in many torch versions,
+    #           so we use torch.special.betainc(a,b,x) instead.
+    #     """
+    #     device = delay_int.device
+    #     md = max_delay.to(device).long()
+    #     k = delay_int.to(device).long()
+    #
+    #     md = md.clamp(min=0)
+    #     k = k.clamp(min=0)
+    #
+    #     # ensure executed delay is within [0..md]
+    #     k = torch.minimum(k, md)
+    #
+    #     # md == 0 => only k==0 possible with prob 1
+    #     is_zero = (md == 0)
+    #
+    #     md_f = md.float().clamp(min=1.0)
+    #
+    #     lower = (k.float() - 0.5) / md_f
+    #     upper = (k.float() + 0.5) / md_f
+    #
+    #     # rounding edge bins
+    #     lower = torch.where(k == 0, torch.zeros_like(lower), lower)
+    #     upper = torch.where(k == md, torch.ones_like(upper), upper)
+    #
+    #     lower = lower.clamp(0.0, 1.0)
+    #     upper = upper.clamp(0.0, 1.0)
+    #
+    #     # ---- Beta CDF via regularized incomplete beta ----
+    #     if not hasattr(torch.special, "betainc"):
+    #         raise RuntimeError(
+    #             "torch.special.betainc not found in your PyTorch build. "
+    #             "You cannot use Fix B (CDF interval) unless you upgrade PyTorch, "
+    #             "or switch to Fix A (store u and use dist.log_prob(u))."
+    #         )
+    #
+    #     a = dist.concentration1
+    #     b = dist.concentration0
+    #
+    #     # (optional but recommended) do betainc in float64 for stability
+    #     lower64 = lower.to(torch.float64)
+    #     upper64 = upper.to(torch.float64)
+    #     a64 = a.to(torch.float64)
+    #     b64 = b.to(torch.float64)
+    #
+    #     F_upper = torch.special.betainc(a64, b64, upper64)
+    #     F_lower = torch.special.betainc(a64, b64, lower64)
+    #
+    #     p_nz = (F_upper - F_lower).to(torch.float32)
+    #     p_nz = p_nz.clamp(min=eps)
+    #
+    #     p = torch.where(is_zero, (k == 0).float(), p_nz)
+    #     return torch.log(p.clamp(min=eps))
 
     def act_assign(
             self,
@@ -688,7 +883,6 @@ class PPO():
             pair_logits,
         )
 
-    import torch
     from torch.distributions import Beta
 
     def act_delay(
@@ -699,7 +893,20 @@ class PPO():
             attn_mask: torch.Tensor | None = None,
             device=None,
             sample: bool = True,
+            eps: float = 1e-6,
     ):
+        """
+        Fix A rollout:
+          - u ~ Beta(alpha,beta)
+          - execute delay_int = round(u * max_delay)
+          - store logprob(u) for PPO (NOT probability of the integer delay)
+          - HOLD and max_delay==0 => delay_int=0, u_logprob=0, entropy=0
+        Returns:
+          delay_int (B,) long
+          u (B,) float
+          u_logprob (B,) float
+          delay_info dict
+        """
         if device is not None:
             state = state.to(device)
             pair_action = pair_action.to(device)
@@ -708,115 +915,122 @@ class PPO():
 
         B = state.size(0)
 
-        # ---- robust max_delay -> tensor (B,) ----
+        # ---- robust max_delay -> (B,) long ----
         if torch.is_tensor(max_delay):
-            md = max_delay.to(state.device).long()
+            md = max_delay.to(state.device).long().view(-1)
         else:
-            md = torch.as_tensor(max_delay, device=state.device).long()
+            md = torch.as_tensor(max_delay, device=state.device).long().view(-1)
 
-        if md.ndim == 0:
-            md = md.view(1)
         if md.numel() == 1 and B > 1:
             md = md.expand(B)
         elif md.numel() != B:
             raise ValueError(f"max_delay has shape {tuple(md.shape)} but expected 1 or {B} elements")
 
-        max_delay = md.clamp(min=0)
+        md = md.clamp(min=0)
+        no_delay = (md == 0)
 
-        # 1) Beta params
-        alpha, beta, is_hold = self.actor_net.delay_params_with_action(state, pair_action, attn_mask)
+        # ---- Beta params (pass max_delay because delay head uses it now) ----
+        alpha, beta, is_hold = self.actor_net.delay_params_with_action(
+            state, pair_action, max_delay=md, attn_mask=attn_mask
+        )
         dist = Beta(alpha, beta)
 
-        # 2) sample/mean u
+        # sample/mean u
         u = dist.sample() if sample else dist.mean
+        u = u.clamp(eps, 1.0 - eps)  # avoid log_prob inf
 
-        delay_logprob = dist.log_prob(u)
+        u_logprob = dist.log_prob(u)
         entropy = dist.entropy()
 
-        # 3) integer delay
-        delay_action = torch.round(u * max_delay.float()).long()
+        # integer delay to execute
+        delay_int = torch.round(u * md.float()).long()
+        delay_int = torch.clamp(delay_int, min=0)
+        delay_int = torch.minimum(delay_int, md)
 
-        # HOLD handling
-        delay_action = torch.where(is_hold, torch.zeros_like(delay_action), delay_action)
-        delay_logprob = torch.where(is_hold, torch.zeros_like(delay_logprob), delay_logprob)
-        entropy = torch.where(is_hold, torch.zeros_like(entropy), entropy)
+        # HOLD or no_delay => force delay=0 and neutralize delay terms
+        neutral = (is_hold | no_delay)
+        delay_int = torch.where(neutral, torch.zeros_like(delay_int), delay_int)
+        u_logprob = torch.where(neutral, torch.zeros_like(u_logprob), u_logprob)
+        entropy = torch.where(neutral, torch.zeros_like(entropy), entropy)
 
         delay_info = {
             "alpha": alpha,
             "beta": beta,
             "u": u,
             "entropy": entropy,
-            "max_delay": max_delay,
+            "max_delay": md,
             "is_hold": is_hold,
+            "no_delay": no_delay,
         }
-
-        return delay_action, delay_logprob, delay_info
+        return delay_int, u, u_logprob, delay_info
 
     def act_assign_delay(
             self,
             state: torch.Tensor,
             pair_actions: torch.Tensor,  # (B,)
-            delay_actions: torch.Tensor,  # (B,) integer delay that env executed
-            pair_mask: torch.Tensor,  # (B, Q*C+1) bool
-            max_delay: int | torch.Tensor,  # scalar or (B,) upper bound used to map u->delay_int
+            u_actions: torch.Tensor,  # (B,) stored u from rollout  <-- Fix A
+            pair_mask: torch.Tensor,  # (B, Q*C+1)
+            max_delay,  # scalar or (B,)
             attn_mask: torch.Tensor | None = None,
             device=None,
             eps: float = 1e-6,
     ):
         """
-        Evaluate logprobs/entropy for PPO given already-taken actions.
-
+        Fix A PPO eval:
+          - pair: masked categorical logprob + entropy
+          - delay: Beta logprob(u_actions) + entropy
+          - neutralize delay terms for HOLD and max_delay==0
         Returns:
-          pair_logprob, delay_logprob, pair_entropy, delay_entropy
+          pair_logprob, u_logprob, pair_entropy, delay_entropy
         """
         if device is not None:
             state = state.to(device)
             pair_actions = pair_actions.to(device)
-            delay_actions = delay_actions.to(device)
+            u_actions = u_actions.to(device)
             pair_mask = pair_mask.to(device)
             if attn_mask is not None:
                 attn_mask = attn_mask.to(device)
 
-        # ----- pair -----
-        pair_logits = self.actor_net(state)  # (B, Q*C+1)
+        B = state.size(0)
+
+        # ----- pair head -----
+        pair_logits = self.actor_net(state)
         dist_pair = CategoricalMasked(logits=pair_logits, masks=pair_mask, device=device)
-        pair_logprob = dist_pair.log_prob(pair_actions)  # (B,)
-        pair_entropy = dist_pair.entropy()  # (B,)
+        pair_actions = pair_actions.long().view(-1)
 
-        # ----- make max_delay tensor (B,) -----
-        if not torch.is_tensor(max_delay):
-            max_delay = torch.tensor([max_delay], dtype=torch.long, device=state.device)
-            if state.size(0) > 1:
-                max_delay = max_delay.expand(state.size(0))
+        pair_logprob = dist_pair.log_prob(pair_actions)
+        pair_entropy = dist_pair.entropy()
+
+        # ----- max_delay -> (B,) -----
+        if torch.is_tensor(max_delay):
+            md = max_delay.to(state.device).long().view(-1)
         else:
-            max_delay = max_delay.to(state.device).long()
-            if max_delay.ndim == 0:
-                max_delay = max_delay.expand(state.size(0))
+            md = torch.as_tensor(max_delay, device=state.device).long().view(-1)
 
-        max_delay = max_delay.clamp(min=0)
+        if md.numel() == 1 and B > 1:
+            md = md.expand(B)
+        elif md.numel() != B:
+            raise ValueError(f"max_delay has shape {tuple(md.shape)} but expected 1 or {B} elements")
 
-        # ----- delay: Beta(alpha,beta) conditioned on pair_actions -----
-        alpha, beta, is_hold = self.actor_net.delay_params_with_action(state, pair_actions, attn_mask)
+        md = md.clamp(min=0)
+        no_delay = (md == 0)
+
+        # ----- delay head -----
+        alpha, beta, is_hold = self.actor_net.delay_params_with_action(
+            state, pair_actions, max_delay=md, attn_mask=attn_mask
+        )
         dist_delay = Beta(alpha, beta)
 
-        # Reconstruct u from integer delay_action and max_delay
-        # If max_delay==0 -> define u=0.5 (arbitrary), but HOLD will be handled below
-        denom = torch.where(max_delay > 0, max_delay.float(), torch.ones_like(max_delay).float())
-        u = (delay_actions.float() / denom).clamp(eps, 1.0 - eps)
+        u_actions = u_actions.float().view(-1).clamp(eps, 1.0 - eps)
+        u_logprob = dist_delay.log_prob(u_actions)
+        delay_entropy = dist_delay.entropy()
 
-        delay_logprob = dist_delay.log_prob(u)  # (B,)
-        delay_entropy = dist_delay.entropy()  # (B,)
+        # Neutralize delay terms when irrelevant
+        neutral = (is_hold | no_delay)
+        u_logprob = torch.where(neutral, torch.zeros_like(u_logprob), u_logprob)
+        delay_entropy = torch.where(neutral, torch.zeros_like(delay_entropy), delay_entropy)
 
-        # HOLD handling: neutralize delay terms (same as during acting)
-        delay_logprob = torch.where(is_hold, torch.zeros_like(delay_logprob), delay_logprob)
-        delay_entropy = torch.where(is_hold, torch.zeros_like(delay_entropy), delay_entropy)
-
-        return (
-            pair_logprob,
-            delay_logprob,
-            pair_entropy,
-            delay_entropy
-        )
+        return pair_logprob, u_logprob, pair_entropy, delay_entropy
 
     def normalize(self, advantages):
         nor_advantages = (advantages - torch.mean(advantages)) / (
@@ -834,28 +1048,45 @@ class PPO():
     #     self.masks1.append(mask1.to("cpu"))
     #     self.masks2.append(mask2.to("cpu"))
     #     # self.job_inputs.append(job_input.to("cpu"))
-    def remember(self, state, value, log_prob1, log_prob2, action1, action2,
-                 reward, mask1, mask2, device):
+    import torch
+
+    def remember(self, state, value, log_prob1, log_prob2,
+                 action1, u, reward, mask1, max_delay, device):
+        """
+        Fix A:
+          action1 = pair_action (int)
+          u       = sampled Beta fraction in (0,1)  (float)
+          log_prob2 = log_prob(u)
+          max_delay stored for reference/execution scale
+        """
         self.rewards_seq.append(reward)
 
         self.states.append(state.detach().to("cpu"))
         self.log_probs1.append(log_prob1.detach().to("cpu"))
-        self.log_probs2.append(log_prob2.detach().to("cpu"))
+        self.log_probs2.append(log_prob2.detach().to("cpu"))  # log_prob(u)
         self.values.append(value.detach().to("cpu"))
-        self.actions1.append(action1.detach().to("cpu"))
-        self.actions2.append(action2.detach().to("cpu"))
 
-        # mask1 should be a torch tensor; if it's numpy, convert
+        # ---- pair action (store as (1,) long) ----
+        a1 = action1 if torch.is_tensor(action1) else torch.as_tensor(action1)
+        self.actions1.append(a1.detach().to("cpu").long().view(1))
+
+        # ---- u action (store as (1,) float) ----
+        u_t = u if torch.is_tensor(u) else torch.as_tensor(u)
+        self.actions2.append(u_t.detach().to("cpu").float().view(1))
+
+        # ---- pair mask (bool) ----
         if not torch.is_tensor(mask1):
             mask1 = torch.as_tensor(mask1, dtype=torch.bool, device=state.device)
         self.masks1.append(mask1.detach().to("cpu"))
 
-        if torch.is_tensor(mask2):
-            md = mask2.detach().to("cpu").long()
+        # ---- max_delay (store as (1,) long) ----
+        if torch.is_tensor(max_delay):
+            md = max_delay.detach().to("cpu").long().view(-1)
         else:
-            md = torch.as_tensor(mask2, dtype=torch.long).to("cpu")
-        md = md.view(1)
-        self.masks2.append(md)
+            md = torch.as_tensor(max_delay, dtype=torch.long).to("cpu").view(-1)
+        if md.numel() != 1:
+            md = md[:1]
+        self.masks2.append(md.view(1))
 
     def clear_memory(self):
         self.rewards_seq = []
@@ -894,13 +1125,14 @@ class PPO():
                                  self.log_probs2,
                                  returns, advantages, len(self.states))
 
-    def compute_value_loss(self, states, returns):
-        state_values = self.critic_net(states)
-        state_values = torch.squeeze(state_values, dim=1)
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
-        # Calculate value loss using F.mse_loss
-        value_loss = F.mse_loss(state_values, returns)
-        return value_loss
+    def compute_value_loss(self, states, returns):
+        returns = returns.to(states.device).float()
+        state_values = self.critic_net(states).squeeze(-1)  # (B,)
+        return F.mse_loss(state_values, returns)
 
     def compute_actor_loss(
             self,
@@ -908,83 +1140,120 @@ class PPO():
             pair_mask,
             max_delay,
             pair_actions,
-            delay_actions,
+            u_actions,  # Fix A: u in (0,1)
             advantages,
-            old_log_probs1,
-            old_log_probs2
+            old_logp_pair,
+            old_logp_u
     ):
-        # NEW: evaluate current policy logprobs under Beta delay head
-        log_probs1, log_probs2, entropy1, entropy2 = self.act_assign_delay(
+        pair_actions = pair_actions.long().view(-1)
+        u_actions = u_actions.float().view(-1)
+        max_delay = max_delay.long().view(-1)
+
+        advantages = advantages.view(-1)
+        old_logp_pair = old_logp_pair.view(-1)
+        old_logp_u = old_logp_u.view(-1)
+
+        # current logprobs + entropy
+        logp_pair, logp_u, ent_pair, ent_u = self.act_assign_delay(
             states,
-            pair_actions,
-            delay_actions,
-            pair_mask,
-            max_delay,
+            pair_actions=pair_actions,
+            u_actions=u_actions,
+            pair_mask=pair_mask,
+            max_delay=max_delay,
             device=self.device
         )
 
-        # PPO ratio for joint action (pair + delay)
-        log_old = old_log_probs1 + old_log_probs2
-        log_new = log_probs1 + log_probs2
-        logratio = log_new - log_old
-        ratio = torch.exp(logratio)
+        # ----------------------------
+        # Metro-style: separate PPO ratios
+        # ----------------------------
+        ratio_pair = torch.exp(logp_pair - old_logp_pair)
+        ratio_u = torch.exp(logp_u - old_logp_u)
 
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.clip_param, 1 + self.clip_param) * advantages
-        policy_loss = -torch.mean(torch.min(surr1, surr2))
+        # clipped surrogate per head (same advantage)
+        surr1_pair = ratio_pair * advantages
+        surr2_pair = torch.clamp(ratio_pair, 1 - self.clip_param, 1 + self.clip_param) * advantages
+        loss_pair = -torch.mean(torch.min(surr1_pair, surr2_pair))
 
-        # entropy bonus
-        entropy = (entropy1 + entropy2) / 2.0
-        entropy_loss = torch.mean(entropy)
+        surr1_u = ratio_u * advantages
+        surr2_u = torch.clamp(ratio_u, 1 - self.clip_param, 1 + self.clip_param) * advantages
+        loss_u = -torch.mean(torch.min(surr1_u, surr2_u))
 
-        total_loss = policy_loss - self.entropy_coefficient * entropy_loss
-        return total_loss, policy_loss, entropy_loss
+        # sum the two clipped objectives
+        w_pair = 1.0
+        w_u = 0.25  # test this shit !
+        policy_loss = w_pair * loss_pair + w_u * loss_u
+        # policy_loss = loss_pair + loss_u
+
+        # entropy bonus separately weighted (you already do this)
+        entropy_bonus = self.ent_coef_pair * ent_pair.mean() + self.ent_coef_delay * ent_u.mean()
+
+        total_loss = policy_loss - entropy_bonus
+        return total_loss, policy_loss, entropy_bonus
 
     def train(self):
-        states = torch.cat(self.buffer.states, dim=0)
-        masks1 = torch.cat(self.buffer.masks1, dim=0)
-        masks2 = torch.cat(self.buffer.masks2, dim=0)
-        actions1 = torch.cat(self.buffer.actions1, dim=0)
-        log_probs1 = torch.cat(self.buffer.log_probs1, dim=0)
-        actions2 = torch.cat(self.buffer.actions2, dim=0)
-        log_probs2 = torch.cat(self.buffer.log_probs2, dim=0)
-        returns = torch.tensor(self.buffer.Returns)
-        advantages = torch.tensor(self.buffer.advantages)
+        # ---- stack buffer ----
+        states = torch.cat(self.buffer.states, dim=0)  # (N, rows, feat)
+        masks1 = torch.cat(self.buffer.masks1, dim=0).bool()  # (N, Q*C+1)
+        maxdelay = torch.cat(self.buffer.masks2, dim=0).view(-1).long()  # (N,)
+
+        actions1 = torch.cat(self.buffer.actions1, dim=0).view(-1).long()  # (N,)
+        u_actions = torch.cat(self.buffer.actions2, dim=0).view(-1).float()  # (N,)  <-- Fix A
+
+        logp1 = torch.cat(self.buffer.log_probs1, dim=0).view(-1)  # (N,)
+        logp2 = torch.cat(self.buffer.log_probs2, dim=0).view(-1)  # (N,)  log_prob(u)
+
+        returns = torch.tensor(self.buffer.Returns, dtype=torch.float32)
+        advantages = torch.tensor(self.buffer.advantages, dtype=torch.float32)
         advantages = self.normalize(advantages)
-        for i in range(self.ppo_update_time):
-            for index in BatchSampler(SubsetRandomSampler(range(len(self.buffer.states))), self.batch_size, False):
-                index_tensor = torch.tensor(index)
-                sampled_states = torch.index_select(states, dim=0, index=index_tensor).to(self.device)
-                sampled_masks1 = torch.index_select(masks1, dim=0, index=index_tensor).to(self.device)
-                sampled_masks2 = torch.index_select(masks2, dim=0, index=index_tensor).to(self.device)
-                sampled_actions1 = torch.index_select(actions1, dim=0, index=index_tensor).to(self.device)
-                sampled_log_probs1 = torch.index_select(log_probs1, dim=0, index=index_tensor).to(self.device)
-                sampled_actions2 = torch.index_select(actions2, dim=0, index=index_tensor).to(self.device)
-                sampled_log_probs2 = torch.index_select(log_probs2, dim=0, index=index_tensor).to(self.device)
-                sampled_returns = torch.index_select(returns, dim=0, index=index_tensor).to(self.device)
-                sampled_advantages = torch.index_select(advantages, dim=0, index=index_tensor).to(self.device)
 
+        N = states.size(0)
+
+        for _ in range(self.ppo_update_time):
+            for index in BatchSampler(SubsetRandomSampler(range(N)), self.batch_size, drop_last=False):
+                idx = torch.tensor(index, dtype=torch.long)
+
+                sampled_states = states.index_select(0, idx).to(self.device)
+                sampled_masks1 = masks1.index_select(0, idx).to(self.device)
+                sampled_maxdelay = maxdelay.index_select(0, idx).to(self.device)
+
+                sampled_a1 = actions1.index_select(0, idx).to(self.device)
+                sampled_u = u_actions.index_select(0, idx).to(self.device)  # <-- Fix A
+                sampled_logp1 = logp1.index_select(0, idx).to(self.device)
+                sampled_logp2 = logp2.index_select(0, idx).to(self.device)
+
+                sampled_ret = returns.index_select(0, idx).to(self.device)
+                sampled_adv = advantages.index_select(0, idx).to(self.device)
+
+                # ---- Actor update ----
                 self.actor_optimizer.zero_grad()
-                action_loss, value_loss, entropy_loss = self.compute_actor_loss(sampled_states,
-                                                                                sampled_masks1,
-                                                                                sampled_masks2,
-                                                                                sampled_actions1,
-                                                                                sampled_actions2,
-                                                                                sampled_advantages,
-                                                                                sampled_log_probs1,
-                                                                                sampled_log_probs2)
-                action_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.actor_net.parameters(), self.max_grad_norm)
+
+                total_loss, policy_loss, entropy_bonus = self.compute_actor_loss(
+                    sampled_states,
+                    sampled_masks1,
+                    sampled_maxdelay,
+                    sampled_a1,
+                    sampled_u,  # <-- Fix A
+                    sampled_adv,
+                    sampled_logp1,
+                    sampled_logp2
+                )
+                # early_stop = False
+                # if approx_kl.item() > 1.5 * self.target_kl:
+                #     early_stop = True
+                #     break
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor_net.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
+                # if early_stop:
+                #     break
 
+                # ---- Critic update ----
                 self.critic_net_optimizer.zero_grad()
-                value_loss = self.compute_value_loss(sampled_states, sampled_returns)
-                value_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.critic_net.parameters(), self.max_grad_norm)
-                self.critic_net_optimizer.step()
 
+                value_loss = self.compute_value_loss(sampled_states, sampled_ret)
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
+                self.critic_net_optimizer.step()
 
     def save_using_model_name(self, model_name_path):
         if not os.path.exists(model_name_path):
@@ -1092,24 +1361,26 @@ def train(env):
                 # pack that 3 up code into 1 code next time !
                 # if mask.any() :
                 #     print(mask)
-                pair_action,  pair_logprob,   value, pair_logits, = ppo.act_assign(state, mask1)
+                # 1) sample pair
+                pair_action, pair_logprob, value, _ = ppo.act_assign(state, mask1)
                 #=================================================
-                mask_delay = env.get_valid_delay_mask(pair_action)
-                # print(f'max delay : {mask_delay}')
+                # 2) get max_delay (upper bound) for this selected pair
+                pair_a = int(pair_action.item())
+                max_delay = env.get_valid_delay_mask(pair_a)
                 # =================================================
-                delay_action, delay_logprob, _ =ppo.act_delay(state, pair_action, mask_delay)
-            ppo.remember(state, value,pair_logprob, delay_logprob, pair_action, delay_action, epoch_reward, mask1, mask_delay, device)
+                # 3) sample delay using Fix A
+                delay_int, u, u_logprob, info = ppo.act_delay(state, pair_action, max_delay)
 
             # print(print(f'agent : {pair_action.item()}'))
             # if pair_action != 180 :
             # delay_action = int(delay_action)
 
             # print(delay_action)
-            o, r, d, truncated, infos = env.step((pair_action.item(),int(delay_action)))
+            o, r, d, truncated, infos = env.step((pair_action.item(),int(delay_int)))
             ep_ret += r
             ep_len += 1
             if ep_ret != 0 :
-                print('reward is :', ep_ret, ep_len, 'time:',env.scheduler.t, "nice_task:",env.scheduler.finish_on_time,
+                print('reward is :', ep_ret, ep_len,'mean delay:', env.scheduler.mean_delay, 'time:',env.scheduler.t, "nice_task:",env.scheduler.finish_on_time,
                         "all execution : ", sum(env.scheduler.runtime_reward_vector), "all energy", sum(env.scheduler.energy_reward_vector),
                       "total wipe:", env.scheduler.total_wipe,
                       "total miss :", env.scheduler.active_queue_miss_counter,
@@ -1123,15 +1394,19 @@ def train(env):
             waiting                   += wt
             slack                    += st
             epoch_reward             += total_r
-            ppo.remember(state, value,
-                         pair_logprob,
-                         delay_logprob,
-                         pair_action,
-                         delay_action,
-                         epoch_reward,
-                         mask1,
-                         mask_delay,
-                         device)
+            # 4) store into PPO buffer (Fix A stores u, not delay_int)
+            ppo.remember(
+                state,
+                value,
+                pair_logprob,
+                u_logprob,  # log_prob2 = log_prob(u)
+                pair_action,  # action1
+                u,  # action2 = u (float)
+                total_r,
+                mask1,
+                max_delay,  # masks2 = max_delay
+                device
+            )
             if d:
                 t += 1
                 ppo.storeIntoBuffter(r)
@@ -1146,7 +1421,8 @@ def train(env):
                 print(f'{t} : traj_num')
                 if t >= traj_num:
                     break
-
+        progress_remaining = 1.0 - (epoch / max(1, epochs - 1))
+        ppo.set_lrs(progress_remaining)
         ppo.train()
         with open('MaskablePPO_' + "16landa" + '.csv', mode='a',
                   newline='') as file:
