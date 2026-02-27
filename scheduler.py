@@ -125,6 +125,8 @@ class Scheduler:
         self.assign_to_6 = []
         self.negative_slack_count = 0
         self.total_delay_slack = 0
+        self.mean_delay = 0
+        self.sum_delay = 0
 ##################################################################################################################################################################################
 ##################################################################################################################################################################################
     # --- rst
@@ -185,6 +187,8 @@ class Scheduler:
         self.number_6_assign = 0
         self.number_6_eject = 0
         self.fail_assign = 0
+        self.mean_delay = 0
+        self.sum_delay = 0
         self.assign_to_2 = []
         self.assign_to_6 = []
         # pre‐fill arrivals at t=0
@@ -676,6 +680,7 @@ class Scheduler:
             # print(m,i, len(self.activeQueue), len(self.backlog), cmd, self.t)
             check_fail_assign = False
             job_delay = self.activeQueue[m]
+            self.sum_delay += delay
             # if job_delay.naughty_task :
             #     job_delay.naughty_task = False
             #     job_delay.rt_est[i] -= job_delay.task_delay
@@ -719,6 +724,7 @@ class Scheduler:
         garbage = 0
         # print(self.valid_vector)
         self.valid_vector.clear()
+        self.mean_delay =  self.sum_delay/self.total_index
         # print("==========================")
         ### reward just for last last episode just for ppo !
         return state, (reward if done else 0), done, garbage,  info
@@ -970,7 +976,7 @@ class Scheduler:
         energy_t   = float(self.energy_reward)
         total = c #- (alpha*runtime_t + gamma*waiting_t + beta*energy_t)/ gg
 
-        return  total, runtime_t, waiting_t, energy_t
+        return  total/1000, runtime_t, waiting_t, energy_t
 #################slack_per_job#############################################################################################################
     def compute_job_slack(self, job: Task) -> float:
         """Compute slack = time‐until‐dl minus earliest‐possible finish time."""
